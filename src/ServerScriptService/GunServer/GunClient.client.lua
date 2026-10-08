@@ -4,6 +4,8 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
 
 local FIRE_RATE = 0.15
 local RANGE = 1000
@@ -38,6 +40,64 @@ tool.Unequipped:Connect(function()
 	mouse.Icon = ""
 	triggerDown = false
 end)
+
+-- Bloedspetters op je scherm die naar beneden druipen en vervagen
+local function bloodOnScreen(amount)
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		return
+	end
+	local gui = playerGui:FindFirstChild("BloodScreen")
+	if not gui then
+		gui = Instance.new("ScreenGui")
+		gui.Name = "BloodScreen"
+		gui.IgnoreGuiInset = true
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 10
+		gui.Parent = playerGui
+	end
+	if #gui:GetChildren() > 40 then
+		return
+	end
+
+	for _ = 1, math.floor(6 * amount + 0.5) do
+		local size = math.random(40, 150) * amount
+		local blob = Instance.new("Frame")
+		blob.AnchorPoint = Vector2.new(0.5, 0.5)
+		blob.Position = UDim2.fromScale(math.random(), math.random())
+		blob.Size = UDim2.fromOffset(size, size * (0.7 + math.random() * 0.6))
+		blob.BackgroundColor3 = Color3.fromRGB(120, 0, 0)
+		blob.BackgroundTransparency = 0.1
+		blob.BorderSizePixel = 0
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0.5, 0)
+		corner.Parent = blob
+
+		-- Straaltje dat naar beneden druipt
+		local drip = Instance.new("Frame")
+		drip.AnchorPoint = Vector2.new(0.5, 0)
+		drip.Position = UDim2.fromScale(0.5, 0.5)
+		drip.Size = UDim2.fromOffset(size * 0.2, 0)
+		drip.BackgroundColor3 = blob.BackgroundColor3
+		drip.BackgroundTransparency = 0.1
+		drip.BorderSizePixel = 0
+		drip.Parent = blob
+		blob.Parent = gui
+
+		local fade = TweenInfo.new(2.5, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		TweenService:Create(blob, fade, {
+			BackgroundTransparency = 1,
+			Position = blob.Position + UDim2.fromOffset(0, math.random(20, 60)),
+		}):Play()
+		TweenService:Create(drip, fade, {
+			BackgroundTransparency = 1,
+			Size = UDim2.fromOffset(size * 0.2, size * (1 + math.random() * 1.5)),
+		}):Play()
+		Debris:AddItem(blob, 2.6)
+	end
+end
+
+ReplicatedStorage:WaitForChild("GoreScreen").OnClientEvent:Connect(bloodOnScreen)
 
 -- Waar wijst de muis naar in de 3D wereld (eigen character genegeerd)
 local function getAimPosition()

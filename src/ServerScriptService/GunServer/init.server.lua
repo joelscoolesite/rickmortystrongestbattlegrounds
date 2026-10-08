@@ -18,13 +18,29 @@ local CONFIG = {
 	DummyPosition = Vector3.new(0, 5, -20),
 	DummyHealth = 100,
 	DummyRespawnTime = 5,
-	MaxSplats = 150, -- max bloedvlekken tegelijk op de grond
-	MaxDroplets = 120, -- max vliegende bloeddruppels tegelijk
-	MaxWoundsPerPart = 8,
+	MaxSplats = 300, -- max bloedvlekken tegelijk op de grond
+	MaxDroplets = 200, -- max vliegende bloeddruppels tegelijk
+	MaxWoundsPerPart = 10,
+	MaxGibs = 80, -- max stukjes vlees/bot tegelijk
+	GibLifetime = 10, -- seconden voordat vlees-stukjes verdwijnen
+	LimbHealth = 45, -- zoveel damage op één arm/been = hij wordt eraf geschoten
+	WoundDripTime = 8, -- zo lang druppelt een kogelgat
+	ScreenSplatterRange = 15, -- dichterbij dan dit schieten = bloed op je scherm
 }
 
 local BLOOD_COLOR = Color3.fromRGB(110, 0, 0)
 local BLOOD_COLOR_LIGHT = Color3.fromRGB(170, 10, 10)
+local FLESH_COLOR = Color3.fromRGB(190, 70, 70)
+local BONE_COLOR = Color3.fromRGB(235, 228, 210)
+
+-- Deze delen kunnen niet los geschoten worden (hoofd ontploft apart)
+local NOT_SEVERABLE = {
+	HumanoidRootPart = true,
+	Head = true,
+	UpperTorso = true,
+	LowerTorso = true,
+	Torso = true,
+}
 
 local rng = Random.new()
 
@@ -33,10 +49,20 @@ local shootEvent = ReplicatedStorage:FindFirstChild("ShootGun") or Instance.new(
 shootEvent.Name = "ShootGun"
 shootEvent.Parent = ReplicatedStorage
 
+-- RemoteEvent voor bloed op je scherm
+local screenEvent = ReplicatedStorage:FindFirstChild("GoreScreen") or Instance.new("RemoteEvent")
+screenEvent.Name = "GoreScreen"
+screenEvent.Parent = ReplicatedStorage
+
 -- Map voor alle effecten (bloed, tracers), zodat raycasts ze kunnen negeren
 local effectsFolder = workspace:FindFirstChild("GoreEffects") or Instance.new("Folder")
 effectsFolder.Name = "GoreEffects"
 effectsFolder.Parent = workspace
+
+-- Map voor vlees-stukjes en afgeschoten armen/benen (die botsen wel met de grond)
+local gibsFolder = workspace:FindFirstChild("GoreGibs") or Instance.new("Folder")
+gibsFolder.Name = "GoreGibs"
+gibsFolder.Parent = workspace
 
 ---------------------------------------------------------------------
 -- Helpers
@@ -59,6 +85,25 @@ local function newEffectPart(props)
 	part.CanQuery = false
 	part.CanTouch = false
 	return part
+end
+
+-- Attachment op een wereld-positie, met de voorkant (LookVector) in een richting
+local function newAttachment(part, name, worldPosition, direction)
+	local attachment = Instance.new("Attachment")
+	attachment.Name = name
+	attachment.Parent = part -- eerst parent, anders klopt WorldCFrame niet
+	attachment.WorldCFrame = CFrame.lookAt(worldPosition, worldPosition + direction)
+	return attachment
+end
+
+-- Zoek de Motor6D die dit lichaamsdeel aan de rest vastmaakt
+local function findJoint(character, part)
+	for _, joint in character:GetDescendants() do
+		if joint:IsA("Motor6D") and joint.Part1 == part then
+			return joint
+		end
+	end
+	return nil
 end
 
 ---------------------------------------------------------------------
@@ -151,8 +196,10 @@ end
 
 local splats = {}
 local activeDroplets = 0
+local activeGibs = 0
 
-local function addSplat(position, normal, size)
+-- Bloedvlek op een oppervlak. growTime = hoe lang hij erover doet om groot te worden.
+local function addSplat(position, normal, size, growTime)
 	-- Platte cilinder; de X-as van een cilinder wijst langs de normaal van het oppervlak
 	local helper = math.abs(normal.Y) < 0.99 and Vector3.yAxis or Vector3.xAxis
 	local up = (helper - normal * normal:Dot(helper)).Unit
@@ -170,7 +217,7 @@ local function addSplat(position, normal, size)
 	})
 	splat.Parent = effectsFolder
 
-	TweenService:Create(splat, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+	TweenService:Create(splat, TweenInfo.new(growTime or 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
 		Size = Vector3.new(0.05, size, size),
 	}):Play()
 
@@ -180,9 +227,19 @@ local function addSplat(position, normal, size)
 	end
 end
 
+-- Grote vlek met kleine spetters eromheen (zoals bloed tegen een muur)
+local function addSpatter(position, normal, size)
+	addSplat(position, normal, size)
+	for _ = 1, 7 do
+		local offset = rng:NextUnitVector() * rng:NextNumber(0.4, size * 1.3)
+		local flat = offset - normal * offset:Dot(normal)
+		addSplat(position + flat, normal, rng:NextNumber(0.15, size * 0.35))
+	end
+end
+
 local dropletParams = RaycastParams.new()
 dropletParams.FilterType = Enum.RaycastFilterType.Exclude
-dropletParams.FilterDescendantsInstances = { effectsFolder }
+dropletParams.FilterDescendantsInstances = { effectsFolder, gibsFolder }
 
 -- Druppel die door de lucht vliegt en een vlek maakt waar hij landt
 local function spawnDroplet(origin, velocity)
@@ -215,11 +272,9 @@ local function spawnDroplet(origin, velocity)
 		vel += Vector3.new(0, -workspace.Gravity, 0) * dt
 		local step = vel * dt
 		local hit = workspace:Raycast(pos, step, dropletParams)
-		if hit then
-			-- Alleen vlekken op vaste dingen (grond, muren), niet op lichamen
-			if hit.Instance.Anchored then
-				addSplat(hit.Position, hit.Normal, rng:NextNumber(0.6, 1.6))
-			end
+		-- Alleen vlekken op vaste dingen (grond, muren); door lichamen vliegt hij heen
+		if hit and hit.Instance.Anchored then
+			addSplat(hit.Position, hit.Normal, rng:NextNumber(0.6, 1.6))
 			finish()
 			return
 		end
@@ -246,15 +301,15 @@ local function makeBloodEmitter(parent)
 	emitter.LightEmission = 0
 	emitter.LightInfluence = 1
 	emitter.Size = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 0.4),
-		NumberSequenceKeypoint.new(1, 0.1),
+		NumberSequenceKeypoint.new(0, 0.6),
+		NumberSequenceKeypoint.new(1, 0.15),
 	})
 	emitter.Transparency = NumberSequence.new({
 		NumberSequenceKeypoint.new(0, 0),
 		NumberSequenceKeypoint.new(1, 1),
 	})
-	emitter.Lifetime = NumberRange.new(0.3, 0.7)
-	emitter.Speed = NumberRange.new(4, 12)
+	emitter.Lifetime = NumberRange.new(0.3, 0.8)
+	emitter.Speed = NumberRange.new(5, 15)
 	emitter.SpreadAngle = Vector2.new(35, 35)
 	emitter.Acceleration = Vector3.new(0, -workspace.Gravity * 0.3, 0)
 	emitter.Drag = 3
@@ -266,18 +321,51 @@ end
 
 -- Bloedspray op de plek waar de kogel inslaat, + even nabloeden
 local function bloodSpray(part, worldPosition, normal, bleedTime)
-	local attachment = Instance.new("Attachment")
-	attachment.Name = "BloodSpray"
-	attachment.WorldCFrame = CFrame.lookAt(worldPosition, worldPosition + normal)
-	attachment.Parent = part
-
+	local attachment = newAttachment(part, "BloodSpray", worldPosition, normal)
 	local emitter = makeBloodEmitter(attachment)
-	emitter:Emit(25)
-	emitter.Rate = 25
+	emitter:Emit(40)
+	emitter.Rate = 30
 	task.delay(bleedTime, function()
 		emitter.Enabled = false
 	end)
 	Debris:AddItem(attachment, bleedTime + 1)
+end
+
+-- Spuitende slagader: klopt als een hart en wordt langzaam zwakker
+local function arterialSpurt(attachment, duration)
+	local emitter = makeBloodEmitter(attachment)
+	emitter.Speed = NumberRange.new(10, 20)
+	emitter.SpreadAngle = Vector2.new(15, 15)
+
+	task.spawn(function()
+		local start = os.clock()
+		while attachment.Parent and os.clock() - start < duration do
+			local t = os.clock() - start
+			local strength = 1 - t / duration
+			local pulse = math.max(0, math.sin(t * 9))
+			emitter.Rate = 80 * pulse * strength
+
+			local dir = attachment.WorldCFrame.LookVector
+			for _ = 1, math.floor(3 * pulse * strength + 0.5) do
+				local velocity = (dir + rng:NextUnitVector() * 0.2).Unit * ((6 + 16 * pulse) * strength + 2)
+				spawnDroplet(attachment.WorldPosition, velocity)
+			end
+			task.wait(0.08)
+		end
+		emitter.Enabled = false
+		Debris:AddItem(attachment, 1)
+	end)
+end
+
+-- Kogelgat dat blijft druppelen
+local function startDrip(wound, duration)
+	task.spawn(function()
+		local stop = os.clock() + duration
+		while wound.Parent and os.clock() < stop do
+			spawnDroplet(wound.Position, Vector3.new(rng:NextNumber(-0.5, 0.5), 0, rng:NextNumber(-0.5, 0.5)))
+			task.wait(rng:NextNumber(0.25, 0.6))
+		end
+	end)
 end
 
 -- Kogelgat dat aan het lichaam vast blijft zitten
@@ -291,9 +379,10 @@ local function addWound(part, position)
 	local wound = newEffectPart({
 		Name = "Wound",
 		Shape = Enum.PartType.Ball,
-		Size = Vector3.one * rng:NextNumber(0.25, 0.4),
+		Size = Vector3.one * rng:NextNumber(0.25, 0.45),
 		Color = Color3.fromRGB(60, 0, 0),
 		Material = Enum.Material.SmoothPlastic,
+		Reflectance = 0.2,
 		Massless = true,
 		CFrame = CFrame.new(position),
 	})
@@ -302,6 +391,182 @@ local function addWound(part, position)
 	weld.Part1 = wound
 	weld.Parent = wound
 	wound.Parent = part
+
+	startDrip(wound, CONFIG.WoundDripTime)
+end
+
+-- Lichaamsdeel wordt steeds roder van het bloed
+local function stainPart(part, amount)
+	if part.Name ~= "HumanoidRootPart" then
+		part.Color = part.Color:Lerp(BLOOD_COLOR, amount)
+	end
+end
+
+-- Stukjes vlees en bot die wegvliegen, met een bloedspoor erachter
+local function spawnGibs(position, direction, count, force)
+	for _ = 1, count do
+		if activeGibs >= CONFIG.MaxGibs then
+			return
+		end
+		activeGibs += 1
+
+		local isBone = rng:NextNumber() < 0.2
+		local size = isBone and Vector3.new(0.15, 0.15, rng:NextNumber(0.4, 0.9))
+			or Vector3.new(rng:NextNumber(0.2, 0.6), rng:NextNumber(0.2, 0.5), rng:NextNumber(0.2, 0.6))
+		local gib = newEffectPart({
+			Name = "Gib",
+			Size = size,
+			Color = isBone and BONE_COLOR or (rng:NextNumber() < 0.5 and FLESH_COLOR or BLOOD_COLOR),
+			Material = Enum.Material.SmoothPlastic,
+			Reflectance = isBone and 0 or 0.2, -- nat vlees glimt een beetje
+			CFrame = CFrame.new(position + rng:NextUnitVector() * 0.3)
+				* CFrame.Angles(rng:NextNumber(0, 6.28), rng:NextNumber(0, 6.28), rng:NextNumber(0, 6.28)),
+		})
+		gib.CanCollide = true
+		gib.CanTouch = true
+
+		local a0 = Instance.new("Attachment")
+		a0.Position = Vector3.new(0, 0.1, 0)
+		a0.Parent = gib
+		local a1 = Instance.new("Attachment")
+		a1.Position = Vector3.new(0, -0.1, 0)
+		a1.Parent = gib
+		local trail = Instance.new("Trail")
+		trail.Attachment0 = a0
+		trail.Attachment1 = a1
+		trail.Color = ColorSequence.new(BLOOD_COLOR_LIGHT, BLOOD_COLOR)
+		trail.Transparency = NumberSequence.new(0, 1)
+		trail.Lifetime = 0.3
+		trail.FaceCamera = true
+		trail.LightInfluence = 1
+		trail.Parent = gib
+
+		gib.Parent = gibsFolder
+		local dir = (direction + rng:NextUnitVector() * 0.8 + Vector3.new(0, 0.6, 0)).Unit
+		gib.AssemblyLinearVelocity = dir * rng:NextNumber(15, 35) * force
+		gib.AssemblyAngularVelocity = rng:NextUnitVector() * 20
+
+		-- Waar hij neerkomt (en stuitert) komt een vlek
+		local splatsLeft, lastSplat = 3, 0
+		gib.Touched:Connect(function(other)
+			if splatsLeft > 0 and other.Anchored and os.clock() - lastSplat > 0.15 then
+				splatsLeft -= 1
+				lastSplat = os.clock()
+				local hit = workspace:Raycast(gib.Position + Vector3.new(0, 1, 0), Vector3.new(0, -4, 0), dropletParams)
+				if hit and hit.Instance.Anchored then
+					addSplat(hit.Position, hit.Normal, rng:NextNumber(0.5, 1.2))
+				end
+			end
+		end)
+
+		task.delay(CONFIG.GibLifetime, function()
+			local fade = TweenService:Create(gib, TweenInfo.new(1), { Transparency = 1 })
+			fade:Play()
+			fade.Completed:Wait()
+			gib:Destroy()
+			activeGibs -= 1
+		end)
+	end
+end
+
+-- Kogel gaat erdoorheen: bloed uit de achterkant en tegen de muur erachter
+local function exitWound(part, entry, direction, character)
+	direction = direction.Unit
+
+	-- Achterkant van het lichaamsdeel vinden (terug raycasten naar het deel zelf)
+	local include = RaycastParams.new()
+	include.FilterType = Enum.RaycastFilterType.Include
+	include.FilterDescendantsInstances = { part }
+	local back = workspace:Raycast(entry + direction * 6, -direction * 6, include)
+	local exitPosition = back and back.Position or entry + direction
+
+	bloodSpray(part, exitPosition, direction, 0.5)
+	bloodBurst(exitPosition, direction, 8, 1.6)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character, effectsFolder, gibsFolder }
+	local wall = workspace:Raycast(exitPosition, direction * 20, params)
+	if wall and wall.Instance.Anchored then
+		addSpatter(wall.Position, wall.Normal, rng:NextNumber(1.2, 2.5))
+	end
+end
+
+-- Arm of been eraf schieten
+local function severLimb(character, part, direction)
+	local joint = findJoint(character, part)
+	local body = joint and joint.Part0
+	if not body then
+		return
+	end
+	local jointPosition = (body.CFrame * joint.C0).Position
+
+	-- Alles wat aan dit deel vast zit gaat mee (bv. onderarm + hand)
+	local limbParts = { part }
+	local i = 1
+	while i <= #limbParts do
+		for _, other in character:GetDescendants() do
+			if other:IsA("Motor6D") and other.Part0 == limbParts[i] and other.Part1 then
+				table.insert(limbParts, other.Part1)
+			end
+		end
+		i += 1
+	end
+
+	joint:Destroy()
+
+	local limb = Instance.new("Model")
+	limb.Name = "SeveredLimb"
+	for _, limbPart in limbParts do
+		limbPart.CanCollide = true
+		limbPart:SetAttribute("Bloody", true)
+		stainPart(limbPart, 0.3)
+		limbPart.Parent = limb
+	end
+	limb.Parent = gibsFolder
+	Debris:AddItem(limb, CONFIG.GibLifetime * 2)
+
+	pcall(function()
+		part:SetNetworkOwner(nil)
+	end)
+	local push = (direction.Unit + Vector3.new(0, 0.8, 0)).Unit
+	part:ApplyImpulse(push * part.AssemblyMass * rng:NextNumber(25, 40))
+
+	-- Stomp aan het lichaam spuit, en het losse deel bloedt ook
+	local outward = jointPosition - body.Position
+	outward = outward.Magnitude > 0.01 and outward.Unit or Vector3.yAxis
+	arterialSpurt(newAttachment(body, "Stump", jointPosition, outward), 6)
+	arterialSpurt(newAttachment(part, "Stump", jointPosition, -outward), 3)
+	spawnGibs(jointPosition, outward, 5, 0.8)
+	bloodBurst(jointPosition, outward, 12, 1.3)
+end
+
+-- Hoofd ontploft
+local function explodeHead(character, head, direction)
+	local position = head.Position
+	local neck = findJoint(character, head)
+	local body = neck and neck.Part0
+
+	spawnGibs(position, direction.Unit, 16, 1.4)
+	bloodBurst(position, Vector3.yAxis, 25, 1.4)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character, effectsFolder, gibsFolder }
+	local wall = workspace:Raycast(position, direction.Unit * 25, params)
+	if wall and wall.Instance.Anchored then
+		addSpatter(wall.Position, wall.Normal, 3.5)
+	end
+
+	if body then
+		local neckPosition = (body.CFrame * neck.C0).Position
+		local outward = neckPosition - body.Position
+		outward = outward.Magnitude > 0.01 and outward.Unit or Vector3.yAxis
+		stainPart(body, 0.4)
+		arterialSpurt(newAttachment(body, "Stump", neckPosition, outward), 7)
+	end
+
+	head:Destroy()
 end
 
 local function hitFlash(character)
@@ -313,25 +578,44 @@ local function hitFlash(character)
 	Debris:AddItem(highlight, 0.1)
 end
 
-local function goreHit(result, character)
+local function goreHit(result, character, direction, damage, dead)
 	local part = result.Instance
 	local isHead = part.Name == "Head"
+
+	-- Dodelijk schot in het hoofd (of op een lijk): hoofd ontploft
+	if isHead and dead then
+		explodeHead(character, part, direction)
+		return
+	end
+
 	addWound(part, result.Position)
+	stainPart(part, 0.15)
 	bloodSpray(part, result.Position, result.Normal, isHead and 2 or 1)
-	bloodBurst(result.Position, result.Normal, isHead and 10 or 6, 1)
+	bloodBurst(result.Position, result.Normal, isHead and 16 or 10, 1.2)
+	exitWound(part, result.Position, direction, character)
+	if rng:NextNumber() < 0.35 then
+		spawnGibs(result.Position, result.Normal, 2, 0.6)
+	end
 	hitFlash(character)
+
+	if not NOT_SEVERABLE[part.Name] then
+		local limbDamage = (part:GetAttribute("LimbDamage") or 0) + damage
+		part:SetAttribute("LimbDamage", limbDamage)
+		if limbDamage >= CONFIG.LimbHealth then
+			severLimb(character, part, direction)
+		end
+	end
 end
 
 -- Grote gore-explosie als iemand doodgaat
 local function goreDeath(character)
 	local root = character:FindFirstChild("HumanoidRootPart")
+	local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
 
 	for _, part in character:GetDescendants() do
 		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and part.CanQuery then
-			bloodBurst(part.Position, rng:NextUnitVector(), 4, 1.3)
-			if part.Name == "Head" or part.Name == "UpperTorso" or part.Name == "Torso" then
-				bloodSpray(part, part.Position, Vector3.yAxis, 3)
-			end
+			bloodBurst(part.Position, rng:NextUnitVector(), 6, 1.5)
+			stainPart(part, 0.3)
 			-- Lichaamsdelen wegschieten
 			if not part.Anchored then
 				local push = (rng:NextUnitVector() + Vector3.new(0, 1, 0)).Unit
@@ -340,11 +624,18 @@ local function goreDeath(character)
 		end
 	end
 
-	-- Bloedplas onder het lichaam
+	if torso then
+		local top = torso.Position + torso.CFrame.UpVector * torso.Size.Y / 2
+		spawnGibs(torso.Position, Vector3.yAxis, 16, 1.2)
+		arterialSpurt(newAttachment(torso, "Stump", top, torso.CFrame.UpVector), 6)
+		bloodSpray(torso, torso.Position, Vector3.yAxis, 3)
+	end
+
+	-- Bloedplas onder het lichaam die langzaam groter wordt
 	if root then
 		local hit = workspace:Raycast(root.Position, Vector3.new(0, -10, 0), dropletParams)
 		if hit and hit.Instance.Anchored then
-			addSplat(hit.Position, hit.Normal, 6)
+			addSplat(hit.Position, hit.Normal, 9, 4)
 		end
 	end
 end
@@ -484,11 +775,29 @@ shootEvent.OnServerEvent:Connect(function(player, targetPosition)
 	local model = result.Instance:FindFirstAncestorOfClass("Model")
 	local targetHumanoid = model and model:FindFirstChildOfClass("Humanoid")
 	if targetHumanoid then
+		local damage = 0
 		if targetHumanoid.Health > 0 then
-			local damage = result.Instance.Name == "Head" and CONFIG.HeadshotDamage or CONFIG.Damage
+			damage = result.Instance.Name == "Head" and CONFIG.HeadshotDamage or CONFIG.Damage
 			targetHumanoid:TakeDamage(damage)
 		end
-		goreHit(result, model)
+		goreHit(result, model, direction, damage, targetHumanoid.Health <= 0)
+
+		-- Bloed op het scherm van de schutter (van dichtbij) en van wie geraakt wordt
+		if (hitPosition - origin).Magnitude <= CONFIG.ScreenSplatterRange then
+			screenEvent:FireClient(player, 1)
+		end
+		local victim = Players:GetPlayerFromCharacter(model)
+		if victim then
+			screenEvent:FireClient(victim, 0.6)
+		end
+	elseif result.Instance:GetAttribute("Bloody") then
+		-- Losse arm/been raken: bloedt en vliegt weg
+		local part = result.Instance
+		bloodBurst(result.Position, result.Normal, 8, 1)
+		pcall(function()
+			part:SetNetworkOwner(nil)
+		end)
+		part:ApplyImpulse(direction.Unit * part.AssemblyMass * 25)
 	end
 end)
 

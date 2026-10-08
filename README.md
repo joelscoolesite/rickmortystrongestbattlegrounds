@@ -2,8 +2,17 @@
 
 ## Gun + Dummy met gore
 
-Schiet op de dummy met het gun → bloedspray, kogelgaten, bloeddruppels die vlekken op de grond maken.
-Gaat de dummy dood, dan valt hij uit elkaar met een grote bloedplas. Na 5 seconden komt er een nieuwe dummy.
+Schiet op de dummy met het gun en je krijgt:
+
+- **Bloedspray** bij de inslag én aan de achterkant (de kogel gaat erdoorheen), met spetters tegen de muur erachter
+- **Kogelgaten** die blijven druppelen, en lichaamsdelen die steeds roder worden
+- **Armen en benen eraf schieten**: 3 kogels op hetzelfde deel en hij vliegt eraf, de stomp spuit bloed als een kloppende slagader
+- **Hoofd ontploft** bij een dodelijke headshot (of als je op het hoofd van een lijk schiet)
+- **Stukjes vlees en bot** die wegvliegen met een bloedspoor en vlekken maken waar ze landen
+- **Bloed op je scherm** als je van dichtbij schiet (of als jij zelf geraakt wordt)
+- Bij doodgaan: alles vliegt uit elkaar, de romp spuit en er komt een bloedplas die langzaam groter wordt
+
+Losse armen/benen kun je nog verder kapotschieten. Na 5 seconden komt er een nieuwe dummy.
 
 ### In Roblox Studio zetten (makkelijkst)
 
@@ -22,7 +31,8 @@ Je hoeft verder niks te bouwen; het script maakt het gun en de dummy zelf.
 
 ### Instellingen
 
-Bovenaan `GunServer` staat `CONFIG` (damage, headshot damage, fire rate, waar de dummy staat, enz.).
+Bovenaan `GunServer` staat `CONFIG` (damage, headshot damage, fire rate, waar de dummy staat, enz.), `LimbHealth` voor hoeveel damage er nodig is om een arm/been eraf te schieten,
+`MaxGibs` / `MaxDroplets` / `MaxSplats` als het te veel lagt).
 
 ### Rojo
 
