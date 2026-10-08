@@ -1,0 +1,567 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><Item class="Script" referent="RBX0"><Properties><string name="Name">GunServer</string><ProtectedString name="Source"><![CDATA[-- GunServer
+-- Zet dit als "Script" in ServerScriptService, met de LocalScript "GunClient" erin.
+-- Maakt automatisch: een Gun (in StarterPack), een Dummy in de wereld,
+-- en regelt het schieten + bloed/gore effecten.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPack = game:GetService("StarterPack")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local CONFIG = {
+	Damage = 20,
+	HeadshotDamage = 50,
+	FireRate = 0.15, -- seconden tussen schoten
+	Range = 300,
+	DummyPosition = Vector3.new(0, 5, -20),
+	DummyHealth = 100,
+	DummyRespawnTime = 5,
+	MaxSplats = 150, -- max bloedvlekken tegelijk op de grond
+	MaxDroplets = 120, -- max vliegende bloeddruppels tegelijk
+	MaxWoundsPerPart = 8,
+}
+
+local BLOOD_COLOR = Color3.fromRGB(110, 0, 0)
+local BLOOD_COLOR_LIGHT = Color3.fromRGB(170, 10, 10)
+
+local rng = Random.new()
+
+-- RemoteEvent waarmee de client laat weten waar hij op schiet
+local shootEvent = ReplicatedStorage:FindFirstChild("ShootGun") or Instance.new("RemoteEvent")
+shootEvent.Name = "ShootGun"
+shootEvent.Parent = ReplicatedStorage
+
+-- Map voor alle effecten (bloed, tracers), zodat raycasts ze kunnen negeren
+local effectsFolder = workspace:FindFirstChild("GoreEffects") or Instance.new("Folder")
+effectsFolder.Name = "GoreEffects"
+effectsFolder.Parent = workspace
+
+---------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------
+
+local function newPart(props)
+	local part = Instance.new("Part")
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	for key, value in props do
+		part[key] = value
+	end
+	return part
+end
+
+-- Effect-part: botst nergens tegen en raycasts gaan erdoorheen
+local function newEffectPart(props)
+	local part = newPart(props)
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	return part
+end
+
+---------------------------------------------------------------------
+-- Gun
+---------------------------------------------------------------------
+
+local function createGun()
+	local tool = Instance.new("Tool")
+	tool.Name = "Gun"
+	tool.CanBeDropped = false
+	tool.ToolTip = "Klik om te schieten"
+
+	local metal = Color3.fromRGB(35, 35, 40)
+
+	-- Handle = de body van het gun. Loop van het gun wijst naar -Z.
+	local handle = newPart({
+		Name = "Handle",
+		Size = Vector3.new(0.4, 0.6, 1.8),
+		Color = metal,
+		Material = Enum.Material.Metal,
+		CanCollide = false,
+		CFrame = CFrame.new(),
+	})
+	handle.Parent = tool
+
+	local function addPiece(name, size, offset, color, material)
+		local piece = newPart({
+			Name = name,
+			Size = size,
+			Color = color or metal,
+			Material = material or Enum.Material.Metal,
+			CanCollide = false,
+			Massless = true,
+			CFrame = handle.CFrame * offset,
+		})
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = handle
+		weld.Part1 = piece
+		weld.Parent = piece
+		piece.Parent = tool
+		return piece
+	end
+
+	addPiece("Barrel", Vector3.new(0.22, 0.22, 1.2), CFrame.new(0, 0.12, -1.4))
+	addPiece("Grip", Vector3.new(0.34, 0.9, 0.45), CFrame.new(0, -0.6, 0.45) * CFrame.Angles(math.rad(-15), 0, 0), Color3.fromRGB(70, 45, 30), Enum.Material.Wood)
+	addPiece("Sight", Vector3.new(0.08, 0.15, 0.1), CFrame.new(0, 0.35, -0.7))
+	addPiece("Mag", Vector3.new(0.28, 0.6, 0.35), CFrame.new(0, -0.55, -0.35))
+
+	-- Punt waar de kogels uitkomen
+	local muzzle = Instance.new("Attachment")
+	muzzle.Name = "Muzzle"
+	muzzle.Position = Vector3.new(0, 0.12, -2.05)
+	muzzle.Parent = handle
+
+	local flashLight = Instance.new("PointLight")
+	flashLight.Name = "FlashLight"
+	flashLight.Color = Color3.fromRGB(255, 200, 100)
+	flashLight.Range = 10
+	flashLight.Brightness = 3
+	flashLight.Enabled = false
+	flashLight.Parent = muzzle
+
+	-- Hand komt op de Grip
+	tool.Grip = CFrame.new(0, -0.6, 0.45)
+
+	return tool
+end
+
+local gunTemplate = createGun()
+-- De client-code (GunClient) gaat mee in het gun, zo is er maar één Script nodig
+local clientScript = script:FindFirstChild("GunClient")
+if clientScript then
+	clientScript:Clone().Parent = gunTemplate
+else
+	warn("GunServer: LocalScript 'GunClient' ontbreekt in dit Script, het gun kan niet schieten!")
+end
+gunTemplate.Parent = StarterPack
+
+-- Spelers die al in de game zitten ook een gun geven
+for _, player in Players:GetPlayers() do
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if backpack and not backpack:FindFirstChild("Gun") then
+		gunTemplate:Clone().Parent = backpack
+	end
+end
+
+---------------------------------------------------------------------
+-- Bloed / gore
+---------------------------------------------------------------------
+
+local splats = {}
+local activeDroplets = 0
+
+local function addSplat(position, normal, size)
+	-- Platte cilinder; de X-as van een cilinder wijst langs de normaal van het oppervlak
+	local helper = math.abs(normal.Y) < 0.99 and Vector3.yAxis or Vector3.xAxis
+	local up = (helper - normal * normal:Dot(helper)).Unit
+	local cf = CFrame.fromMatrix(position + normal * 0.03, normal, up) * CFrame.Angles(rng:NextNumber(0, math.pi * 2), 0, 0)
+
+	local splat = newEffectPart({
+		Name = "BloodSplat",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.05, 0.1, 0.1),
+		Color = rng:NextNumber() < 0.5 and BLOOD_COLOR or BLOOD_COLOR_LIGHT,
+		Material = Enum.Material.SmoothPlastic,
+		Reflectance = 0.15,
+		Anchored = true,
+		CFrame = cf,
+	})
+	splat.Parent = effectsFolder
+
+	TweenService:Create(splat, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(0.05, size, size),
+	}):Play()
+
+	table.insert(splats, splat)
+	if #splats > CONFIG.MaxSplats then
+		table.remove(splats, 1):Destroy()
+	end
+end
+
+local dropletParams = RaycastParams.new()
+dropletParams.FilterType = Enum.RaycastFilterType.Exclude
+dropletParams.FilterDescendantsInstances = { effectsFolder }
+
+-- Druppel die door de lucht vliegt en een vlek maakt waar hij landt
+local function spawnDroplet(origin, velocity)
+	if activeDroplets >= CONFIG.MaxDroplets then
+		return
+	end
+	activeDroplets += 1
+
+	local drop = newEffectPart({
+		Name = "BloodDrop",
+		Shape = Enum.PartType.Ball,
+		Size = Vector3.one * rng:NextNumber(0.15, 0.35),
+		Color = BLOOD_COLOR_LIGHT,
+		Material = Enum.Material.SmoothPlastic,
+		Anchored = true,
+		Position = origin,
+	})
+	drop.Parent = effectsFolder
+
+	local pos, vel, age = origin, velocity, 0
+	local connection
+	local function finish()
+		connection:Disconnect()
+		drop:Destroy()
+		activeDroplets -= 1
+	end
+
+	connection = RunService.Heartbeat:Connect(function(dt)
+		age += dt
+		vel += Vector3.new(0, -workspace.Gravity, 0) * dt
+		local step = vel * dt
+		local hit = workspace:Raycast(pos, step, dropletParams)
+		if hit then
+			-- Alleen vlekken op vaste dingen (grond, muren), niet op lichamen
+			if hit.Instance.Anchored then
+				addSplat(hit.Position, hit.Normal, rng:NextNumber(0.6, 1.6))
+			end
+			finish()
+			return
+		end
+		pos += step
+		drop.Position = pos
+		if age > 4 then
+			finish()
+		end
+	end)
+end
+
+local function bloodBurst(position, normal, count, force)
+	for _ = 1, count do
+		local dir = (normal + rng:NextUnitVector() * 0.9).Unit
+		local velocity = dir * rng:NextNumber(8, 20) * force + Vector3.new(0, rng:NextNumber(2, 8), 0)
+		spawnDroplet(position + normal * 0.15, velocity)
+	end
+end
+
+local function makeBloodEmitter(parent)
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	emitter.Color = ColorSequence.new(BLOOD_COLOR_LIGHT, BLOOD_COLOR)
+	emitter.LightEmission = 0
+	emitter.LightInfluence = 1
+	emitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.4),
+		NumberSequenceKeypoint.new(1, 0.1),
+	})
+	emitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	emitter.Lifetime = NumberRange.new(0.3, 0.7)
+	emitter.Speed = NumberRange.new(4, 12)
+	emitter.SpreadAngle = Vector2.new(35, 35)
+	emitter.Acceleration = Vector3.new(0, -workspace.Gravity * 0.3, 0)
+	emitter.Drag = 3
+	emitter.Rate = 0
+	emitter.EmissionDirection = Enum.NormalId.Front
+	emitter.Parent = parent
+	return emitter
+end
+
+-- Bloedspray op de plek waar de kogel inslaat, + even nabloeden
+local function bloodSpray(part, worldPosition, normal, bleedTime)
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "BloodSpray"
+	attachment.WorldCFrame = CFrame.lookAt(worldPosition, worldPosition + normal)
+	attachment.Parent = part
+
+	local emitter = makeBloodEmitter(attachment)
+	emitter:Emit(25)
+	emitter.Rate = 25
+	task.delay(bleedTime, function()
+		emitter.Enabled = false
+	end)
+	Debris:AddItem(attachment, bleedTime + 1)
+end
+
+-- Kogelgat dat aan het lichaam vast blijft zitten
+local function addWound(part, position)
+	local count = part:GetAttribute("Wounds") or 0
+	if count >= CONFIG.MaxWoundsPerPart then
+		return
+	end
+	part:SetAttribute("Wounds", count + 1)
+
+	local wound = newEffectPart({
+		Name = "Wound",
+		Shape = Enum.PartType.Ball,
+		Size = Vector3.one * rng:NextNumber(0.25, 0.4),
+		Color = Color3.fromRGB(60, 0, 0),
+		Material = Enum.Material.SmoothPlastic,
+		Massless = true,
+		CFrame = CFrame.new(position),
+	})
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = part
+	weld.Part1 = wound
+	weld.Parent = wound
+	wound.Parent = part
+end
+
+local function hitFlash(character)
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = Color3.fromRGB(255, 0, 0)
+	highlight.FillTransparency = 0.5
+	highlight.OutlineTransparency = 1
+	highlight.Parent = character
+	Debris:AddItem(highlight, 0.1)
+end
+
+local function goreHit(result, character)
+	local part = result.Instance
+	local isHead = part.Name == "Head"
+	addWound(part, result.Position)
+	bloodSpray(part, result.Position, result.Normal, isHead and 2 or 1)
+	bloodBurst(result.Position, result.Normal, isHead and 10 or 6, 1)
+	hitFlash(character)
+end
+
+-- Grote gore-explosie als iemand doodgaat
+local function goreDeath(character)
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	for _, part in character:GetDescendants() do
+		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and part.CanQuery then
+			bloodBurst(part.Position, rng:NextUnitVector(), 4, 1.3)
+			if part.Name == "Head" or part.Name == "UpperTorso" or part.Name == "Torso" then
+				bloodSpray(part, part.Position, Vector3.yAxis, 3)
+			end
+			-- Lichaamsdelen wegschieten
+			if not part.Anchored then
+				local push = (rng:NextUnitVector() + Vector3.new(0, 1, 0)).Unit
+				part:ApplyImpulse(push * part.AssemblyMass * rng:NextNumber(20, 40))
+			end
+		end
+	end
+
+	-- Bloedplas onder het lichaam
+	if root then
+		local hit = workspace:Raycast(root.Position, Vector3.new(0, -10, 0), dropletParams)
+		if hit and hit.Instance.Anchored then
+			addSplat(hit.Position, hit.Normal, 6)
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Dummy
+---------------------------------------------------------------------
+
+local function createDummy()
+	local description = Instance.new("HumanoidDescription")
+	local skin = Color3.fromRGB(200, 200, 200)
+	description.HeadColor = skin
+	description.TorsoColor = skin
+	description.LeftArmColor = skin
+	description.RightArmColor = skin
+	description.LeftLegColor = skin
+	description.RightLegColor = skin
+
+	local dummy = Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R15)
+	dummy.Name = "Dummy"
+
+	local humanoid = dummy:FindFirstChildOfClass("Humanoid")
+	humanoid.DisplayName = "Dummy"
+	humanoid.MaxHealth = CONFIG.DummyHealth
+	humanoid.Health = CONFIG.DummyHealth
+	humanoid.WalkSpeed = 0
+	humanoid.JumpPower = 0
+	humanoid.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOn
+	humanoid.BreakJointsOnDeath = true -- valt uit elkaar als hij doodgaat
+
+	dummy:PivotTo(CFrame.new(CONFIG.DummyPosition) * CFrame.Angles(0, math.pi, 0))
+	dummy.Parent = workspace
+
+	local root = dummy:FindFirstChild("HumanoidRootPart")
+	if root then
+		root:SetNetworkOwner(nil)
+	end
+
+	humanoid.Died:Connect(function()
+		task.defer(goreDeath, dummy)
+		task.delay(CONFIG.DummyRespawnTime, function()
+			dummy:Destroy()
+			createDummy()
+		end)
+	end)
+end
+
+createDummy()
+
+---------------------------------------------------------------------
+-- Schieten
+---------------------------------------------------------------------
+
+local function tracer(from, to)
+	local distance = (to - from).Magnitude
+	local beam = newEffectPart({
+		Name = "Tracer",
+		Size = Vector3.new(0.06, 0.06, distance),
+		CFrame = CFrame.lookAt((from + to) / 2, to),
+		Color = Color3.fromRGB(255, 220, 120),
+		Material = Enum.Material.Neon,
+		Anchored = true,
+	})
+	beam.Parent = effectsFolder
+	Debris:AddItem(beam, 0.05)
+end
+
+local function muzzleFlash(muzzle)
+	local light = muzzle:FindFirstChild("FlashLight")
+	if light then
+		light.Enabled = true
+		task.delay(0.05, function()
+			light.Enabled = false
+		end)
+	end
+	local flash = newEffectPart({
+		Name = "MuzzleFlash",
+		Shape = Enum.PartType.Ball,
+		Size = Vector3.one * 0.5,
+		Color = Color3.fromRGB(255, 200, 80),
+		Material = Enum.Material.Neon,
+		Anchored = true,
+		Position = muzzle.WorldPosition,
+	})
+	flash.Parent = effectsFolder
+	Debris:AddItem(flash, 0.05)
+end
+
+local lastShot = {}
+
+shootEvent.OnServerEvent:Connect(function(player, targetPosition)
+	if typeof(targetPosition) ~= "Vector3" then
+		return
+	end
+
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	local tool = character:FindFirstChild("Gun")
+	local handle = tool and tool:IsA("Tool") and tool:FindFirstChild("Handle")
+	local muzzle = handle and handle:FindFirstChild("Muzzle")
+	if not muzzle then
+		return
+	end
+
+	-- Anti-spam: niet sneller schieten dan de fire rate
+	local now = os.clock()
+	if lastShot[player] and now - lastShot[player] < CONFIG.FireRate * 0.8 then
+		return
+	end
+	lastShot[player] = now
+
+	local origin = muzzle.WorldPosition
+	local direction = targetPosition - origin
+	if direction.Magnitude < 0.01 then
+		return
+	end
+	direction = direction.Unit * CONFIG.Range
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character, effectsFolder }
+
+	local result = workspace:Raycast(origin, direction, params)
+	local hitPosition = result and result.Position or origin + direction
+
+	muzzleFlash(muzzle)
+	tracer(origin, hitPosition)
+
+	if not result then
+		return
+	end
+
+	local model = result.Instance:FindFirstAncestorOfClass("Model")
+	local targetHumanoid = model and model:FindFirstChildOfClass("Humanoid")
+	if targetHumanoid then
+		if targetHumanoid.Health > 0 then
+			local damage = result.Instance.Name == "Head" and CONFIG.HeadshotDamage or CONFIG.Damage
+			targetHumanoid:TakeDamage(damage)
+		end
+		goreHit(result, model)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	lastShot[player] = nil
+end)
+]]></ProtectedString></Properties><Item class="LocalScript" referent="RBX1"><Properties><string name="Name">GunClient</string><ProtectedString name="Source"><![CDATA[-- GunClient
+-- Zit in het Gun zelf (GunServer zet hem erin). Houd de muis ingedrukt = automatisch schieten.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local FIRE_RATE = 0.15
+local RANGE = 1000
+
+local tool = script.Parent
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+local shootEvent = ReplicatedStorage:WaitForChild("ShootGun")
+
+local triggerDown = false
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		triggerDown = true
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		triggerDown = false
+	end
+end)
+
+tool.Equipped:Connect(function()
+	mouse.Icon = "rbxasset://SystemCursors/Cross"
+end)
+
+tool.Unequipped:Connect(function()
+	mouse.Icon = ""
+	triggerDown = false
+end)
+
+-- Waar wijst de muis naar in de 3D wereld (eigen character genegeerd)
+local function getAimPosition()
+	local camera = workspace.CurrentCamera
+	local mousePosition = UserInputService:GetMouseLocation()
+	local ray = camera:ViewportPointToRay(mousePosition.X, mousePosition.Y)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignore = { player.Character }
+	local effects = workspace:FindFirstChild("GoreEffects")
+	if effects then
+		table.insert(ignore, effects)
+	end
+	params.FilterDescendantsInstances = ignore
+
+	local result = workspace:Raycast(ray.Origin, ray.Direction * RANGE, params)
+	return result and result.Position or ray.Origin + ray.Direction * RANGE
+end
+
+while tool.Parent do
+	local equipped = player.Character ~= nil and tool.Parent == player.Character
+	if equipped and triggerDown then
+		shootEvent:FireServer(getAimPosition())
+		task.wait(FIRE_RATE)
+	else
+		task.wait()
+	end
+end
+]]></ProtectedString></Properties></Item></Item></roblox>

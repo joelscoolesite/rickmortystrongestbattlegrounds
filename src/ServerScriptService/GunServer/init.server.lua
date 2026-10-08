@@ -1,5 +1,5 @@
 -- GunServer
--- Zet dit als "Script" in ServerScriptService.
+-- Zet dit als "Script" in ServerScriptService, met de LocalScript "GunClient" erin.
 -- Maakt automatisch: een Gun (in StarterPack), een Dummy in de wereld,
 -- en regelt het schieten + bloed/gore effecten.
 
@@ -128,6 +128,13 @@ local function createGun()
 end
 
 local gunTemplate = createGun()
+-- De client-code (GunClient) gaat mee in het gun, zo is er maar één Script nodig
+local clientScript = script:FindFirstChild("GunClient")
+if clientScript then
+	clientScript:Clone().Parent = gunTemplate
+else
+	warn("GunServer: LocalScript 'GunClient' ontbreekt in dit Script, het gun kan niet schieten!")
+end
 gunTemplate.Parent = StarterPack
 
 -- Spelers die al in de game zitten ook een gun geven
